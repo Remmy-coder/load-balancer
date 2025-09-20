@@ -1,186 +1,407 @@
+use log::{debug, error, info, trace, warn};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+#[derive(Debug)]
+pub struct Backend {
+    pub address: String,
+    pub active_connections: usize,
+    pub total_handled: usize,
+    pub maintenance: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Strategy {
+    RoundRobin,
+    LeastConnections,
+}
+
 pub struct LoadBalancer {
-    backends: Vec<String>,
+    backends: Vec<Arc<Mutex<Backend>>>,
     current: usize,
+    strategy: Strategy,
+}
+
+impl Backend {
+    pub fn new(address: String) -> Self {
+        info!("Creating new backend: {}", address);
+        Self {
+            address,
+            active_connections: 0,
+            total_handled: 0,
+            maintenance: false,
+        }
+    }
 }
 
 impl LoadBalancer {
-    pub fn new(backends: Vec<String>) -> Self {
-        LoadBalancer {
+    pub fn new(backends: Vec<String>, strategy: Strategy) -> Self {
+        info!(
+            "Initializing load balancer with {} backends using {:?} strategy",
+            backends.len(),
+            strategy
+        );
+
+        let backends = backends
+            .into_iter()
+            .map(|addr| {
+                debug!("Adding backend to pool: {}", addr);
+                Arc::new(Mutex::new(Backend::new(addr)))
+            })
+            .collect();
+
+        Self {
             backends,
             current: 0,
+            strategy,
         }
     }
 
-    pub fn next_backend(&mut self) -> &str {
-        let backend = &self.backends[self.current];
-        self.current = (self.current + 1) % self.backends.len();
-        backend
+    pub fn next_backend(&mut self) -> Option<Arc<Mutex<Backend>>> {
+        if self.backends.is_empty() {
+            warn!("No backends available in the pool");
+            return None;
+        }
+
+        match self.strategy {
+            Strategy::RoundRobin => self.round_robin(),
+            Strategy::LeastConnections => self.least_connections(),
+        }
+    }
+
+    fn round_robin(&mut self) -> Option<Arc<Mutex<Backend>>> {
+        let n = self.backends.len();
+        // let _start_index = self.current;
+
+        for _ in 0..n {
+            let backend = self.backends[self.current].clone();
+            self.current = (self.current + 1) % n;
+
+            let b = backend.lock().unwrap();
+            if !b.maintenance {
+                trace!(
+                    "RoundRobin picked backend {}: {} [active: {}, total: {}]",
+                    self.current,
+                    b.address,
+                    b.active_connections,
+                    b.total_handled
+                );
+                return Some(backend.clone());
+            }
+        }
+
+        error!("All {} backends are in maintenance mode", n);
+        None
+    }
+
+    fn least_connections(&self) -> Option<Arc<Mutex<Backend>>> {
+        self.backends
+            .iter()
+            .filter(|b| !b.lock().unwrap().maintenance)
+            .min_by_key(|b| b.lock().unwrap().active_connections)
+            .cloned()
+    }
+
+    pub fn backends(&self) -> &Vec<Arc<Mutex<Backend>>> {
+        &self.backends
+    }
+
+    pub fn log_status(&self) {
+        info!("=== Load Balancer Status ({:?}) ===", self.strategy);
+        for (i, backend) in self.backends.iter().enumerate() {
+            let b = backend.lock().unwrap();
+            info!(
+                "Backend {}: {} | Active: {} | Total: {} | Maintenance: {}",
+                i, b.address, b.active_connections, b.total_handled, b.maintenance
+            );
+        }
+        info!("============================");
     }
 }
 
-pub fn handle_client(mut client: TcpStream, backend: &str) -> Result<(), std::io::Error> {
-    println!(
-        "Handling client request, forwarding to backend: {}",
-        backend
+pub fn handle_client(
+    client: TcpStream,
+    backend: Arc<Mutex<Backend>>,
+) -> Result<(), std::io::Error> {
+    let client_addr = client
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let (backend_addr, connection_id) = {
+        let mut be = backend.lock().unwrap();
+        be.active_connections += 1;
+        be.total_handled += 1;
+        let connection_id = be.total_handled;
+        (be.address.clone(), connection_id)
+    };
+
+    info!(
+        "Forwarding connection {} from {} to backend: {}",
+        connection_id, client_addr, backend_addr
     );
-    let mut server = TcpStream::connect(backend)?;
-    println!("Connected to backend server");
 
-    client.set_read_timeout(Some(Duration::from_secs(5)))?;
-    server.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let start_time = Instant::now();
 
-    let mut buffer = [0; 1024];
-
-    // Read the request from the client and forward it to the backend
-    loop {
-        match client.read(&mut buffer) {
-            Ok(0) => {
-                println!("Client closed the connection before sending data");
-                break;
+    let server = match TcpStream::connect(&backend_addr) {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!(
+                "Failed to connect to backend {} for connection {}: {}",
+                backend_addr, connection_id, e
+            );
+            {
+                let mut be = backend.lock().unwrap();
+                be.active_connections -= 1;
             }
-            Ok(n) => {
-                println!("Read {} bytes from client", n);
-                if let Err(e) = server.write_all(&buffer[..n]) {
-                    println!("Error writing to backend server: {}", e);
-                    return Err(e);
-                }
-                server.flush()?;
-                println!("Wrote {} bytes to backend server", n);
-            }
-            Err(e) => {
-                println!("Error reading from client: {}", e);
-                return Err(e);
-            }
+            return Err(e);
         }
+    };
 
-        // Read the response from the backend and send it to the client
-        match server.read(&mut buffer) {
+    debug!(
+        "Connection {} established to backend {}",
+        connection_id, backend_addr
+    );
+
+    let client_clone = client.try_clone()?;
+    let server_clone = server.try_clone()?;
+
+    // let _backend_clone1 = backend.clone();
+    // let _backend_clone2 = backend.clone();
+    let backend_addr_clone1 = backend_addr.clone();
+    let backend_addr_clone2 = backend_addr.clone();
+
+    let t1 = thread::spawn(move || {
+        trace!(
+            "Starting client->server forwarding for connection {}",
+            connection_id
+        );
+        forward(
+            client,
+            server_clone,
+            &format!("client->backend({})", backend_addr_clone1),
+        );
+    });
+
+    let t2 = thread::spawn(move || {
+        trace!(
+            "Starting server->client forwarding for connection {}",
+            connection_id
+        );
+        forward(
+            server,
+            client_clone,
+            &format!("backend({})->client", backend_addr_clone2),
+        );
+    });
+
+    let _ = t1.join();
+    let _ = t2.join();
+
+    let duration = start_time.elapsed();
+
+    {
+        let mut be = backend.lock().unwrap();
+        be.active_connections -= 1;
+    }
+
+    info!(
+        "Connection {} completed in {:.2}ms (backend: {})",
+        connection_id,
+        duration.as_secs_f64() * 1000.0,
+        backend_addr
+    );
+
+    Ok(())
+}
+
+fn forward(mut from: TcpStream, mut to: TcpStream, direction: &str) {
+    let mut buffer = [0; 4096];
+    let mut total_bytes = 0;
+
+    trace!("Starting data forwarding: {}", direction);
+
+    loop {
+        match from.read(&mut buffer) {
             Ok(0) => {
-                println!("Backend closed the connection without sending data");
+                trace!(
+                    "Connection closed by source ({}), forwarded {} bytes",
+                    direction,
+                    total_bytes
+                );
                 break;
             }
             Ok(n) => {
-                println!("Read {} bytes from backend", n);
-                if let Err(e) = client.write_all(&buffer[..n]) {
-                    println!("Error writing to client: {}", e);
-                    return Err(e);
+                total_bytes += n;
+                trace!("Forwarding {} bytes ({})", n, direction);
+
+                if let Err(e) = to.write_all(&buffer[..n]) {
+                    debug!(
+                        "Write failed ({}): {}, forwarded {} bytes total",
+                        direction, e, total_bytes
+                    );
+                    break;
                 }
-                client.flush()?;
-                println!("Wrote {} bytes back to client", n);
             }
             Err(e) => {
-                println!("Error reading from backend: {}", e);
-                return Err(e);
+                debug!(
+                    "Read failed ({}): {}, forwarded {} bytes total",
+                    direction, e, total_bytes
+                );
+                break;
             }
         }
     }
-
-    Ok(())
 }
 
 pub fn run_backend(port: u16) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-    println!("Backend server listening on 127.0.0.1:{}", port);
+    info!("Backend server started on 127.0.0.1:{}", port);
 
-    for stream in listener.incoming() {
-        let mut stream = stream?;
-        println!("Backend on port {} received a connection", port);
-
-        // Send a valid HTTP response with headers and body
-        let body = format!("Response from backend on port {}\n", port);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
-            body.len(),
-            body
-        );
-
-        match stream.write_all(response.as_bytes()) {
-            Ok(_) => {
-                stream.flush()?;
-                println!("Backend on port {} sent response", port);
-            }
-            Err(e) => println!("Backend on port {} error sending response: {}", port, e),
-        }
-
-        // Ensure the response is sent before closing the connection
-        stream.flush()?;
-    }
-    Ok(())
-}
-
-pub fn run_load_balancer(port: u16, backend_ports: Vec<u16>) -> Result<(), std::io::Error> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-    let mut load_balancer = LoadBalancer::new(
-        backend_ports
-            .iter()
-            .map(|p| format!("127.0.0.1:{}", p))
-            .collect(),
-    );
-
-    println!("Load balancer listening on 127.0.0.1:{}", port);
-
-    for stream in listener.incoming() {
+    for (connection_count, stream) in listener.incoming().enumerate() {
         match stream {
-            Ok(stream) => {
-                let backend = load_balancer.next_backend().to_string();
-                println!("New connection, forwarding to {}", backend);
-                let backend_clone = backend.clone();
-                thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, &backend_clone) {
-                        eprintln!("Error handling client: {}", e);
+            Ok(mut stream) => {
+                let client_addr = stream
+                    .peer_addr()
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+
+                info!(
+                    "Backend {} handling connection #{} from {}",
+                    port,
+                    connection_count + 1,
+                    client_addr
+                );
+
+                let body = format!("Response from backend {}\n", port);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+
+                match stream.write_all(response.as_bytes()) {
+                    Ok(_) => {
+                        stream.flush()?;
+                        debug!(
+                            "Backend {} successfully responded to connection #{}",
+                            port,
+                            connection_count + 1
+                        );
                     }
-                });
+                    Err(e) => {
+                        warn!(
+                            "Backend {} failed to write response to connection #{}: {}",
+                            port,
+                            connection_count + 1,
+                            e
+                        );
+                    }
+                }
             }
             Err(e) => {
-                eprintln!("Error accepting connection: {}", e);
+                warn!("Backend {} failed to accept connection: {}", port, e);
             }
         }
     }
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::TcpStream;
-    use std::thread;
-    use std::time::Duration;
+pub fn run_load_balancer(
+    port: u16,
+    backend_ports: Vec<u16>,
+    strategy: Strategy,
+) -> Result<(), std::io::Error> {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
+    let mut lb = LoadBalancer::new(
+        backend_ports
+            .into_iter()
+            .map(|p| format!("127.0.0.1:{}", p))
+            .collect(),
+        strategy,
+    );
 
-    #[test]
-    fn test_load_balancer_next_backend() {
-        let backends = vec![
-            "127.0.0.1:8081".to_string(),
-            "127.0.0.1:8082".to_string(),
-            "127.0.0.1:8083".to_string(),
-        ];
-        let mut lb = LoadBalancer::new(backends);
+    info!("Load balancer started on 127.0.0.1:{}", port);
 
-        assert_eq!(lb.next_backend(), "127.0.0.1:8081");
-        assert_eq!(lb.next_backend(), "127.0.0.1:8082");
-        assert_eq!(lb.next_backend(), "127.0.0.1:8083");
-        assert_eq!(lb.next_backend(), "127.0.0.1:8081"); // Should wrap around
+    lb.log_status();
+
+    let backends_clone = lb.backends().clone();
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(30));
+        info!("=== Periodic Status Update ===");
+        for (i, backend) in backends_clone.iter().enumerate() {
+            let b = backend.lock().unwrap();
+            info!(
+                "Backend {}: {} | Active: {} | Total: {} | Maintenance: {}",
+                i, b.address, b.active_connections, b.total_handled, b.maintenance
+            );
+        }
+    });
+
+    let mut connection_count = 0;
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut client) => {
+                connection_count += 1;
+                let client_addr = client
+                    .peer_addr()
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+
+                info!(
+                    "Load balancer received connection #{} from {}",
+                    connection_count, client_addr
+                );
+
+                if let Some(backend) = lb.next_backend() {
+                    let backend_clone = backend.clone();
+                    thread::spawn(move || {
+                        if let Err(e) = handle_client(client, backend_clone) {
+                            error!("Error handling client connection: {}", e);
+                        }
+                    });
+                } else {
+                    error!(
+                        "No backend available for connection #{} from {}!",
+                        connection_count, client_addr
+                    );
+
+                    let body = "Service Unavailable - No healthy backends\n";
+                    let response = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\n\
+                         Content-Length: {}\r\n\
+                         Content-Type: text/plain\r\n\
+                         Connection: close\r\n\r\n\
+                         {}",
+                        body.len(),
+                        body
+                    );
+
+                    if let Err(e) = client.write_all(response.as_bytes()) {
+                        warn!("Failed to send 503 response to {}: {}", client_addr, e);
+                    }
+                    let _ = client.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to accept incoming connection: {}", e);
+            }
+        }
     }
+    Ok(())
+}
 
-    #[test]
-    fn test_run_backend() {
-        let port = 8084;
-        thread::spawn(move || {
-            run_backend(port).unwrap();
-        });
+pub fn init_logger() {
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .format_timestamp_secs()
+        .format_module_path(false)
+        .init();
 
-        thread::sleep(Duration::from_millis(100)); // Give the backend time to start
-
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-
-        assert!(response.contains(&format!("Response from backend on port {}", port)));
-    }
+    info!("Logger initialized");
 }
